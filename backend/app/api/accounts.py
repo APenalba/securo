@@ -15,11 +15,13 @@ from app.core.workspace_context import (
 from app.schemas.account import (
     AccountCreate,
     AccountRead,
+    AccountRunningBalancePoint,
     AccountSummary,
     AccountUpdate,
     CreditCardBillRead,
 )
 from app.services import account_service
+from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.fx_rate_service import _resolve_rate
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
@@ -114,6 +116,28 @@ async def get_account_balance_history(
                 point["balance_primary"] = float(converted.quantize(Decimal("0.01")))
 
     return history
+
+
+@router.get("/{account_id}/running-balance", response_model=list[AccountRunningBalancePoint])
+async def get_account_running_balance(
+    account_id: uuid.UUID,
+    date_from: Optional[date] = Query(None, alias="from"),
+    date_to: Optional[date] = Query(None, alias="to"),
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Daily balance matching the transaction list's `running_balance` (#1202)."""
+    accounting_mode = await get_credit_card_accounting_mode(session)
+    try:
+        series = await account_service.get_account_running_balance(
+            session, account_id, ctx.workspace.id, ctx.user.primary_currency,
+            accounting_mode=accounting_mode, date_from=date_from, date_to=date_to,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if series is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    return series
 
 
 @router.get("/{account_id}/bills", response_model=list[CreditCardBillRead])
