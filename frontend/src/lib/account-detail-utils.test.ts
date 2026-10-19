@@ -171,7 +171,11 @@ describe('runningBalanceChartFrom', () => {
     expect(runningBalanceChartFrom('2025-08-01', '2026-10-31')).toBe('2025-08-01')
   })
 
-  it('charts the latest 3,660 days of a longer range', () => {
-    expect(runningBalanceChartFrom('2000-01-01', '2026-10-31')).toBe('2016-10-24')
+  it('charts the latest ten years of a longer range', () => {
+    expect(runningBalanceChartFrom('2000-01-01', '2026-10-31')).toBe('2016-10-31')
+  })
+
+  it('stays inside the cap when the range ends on Feb 29', () => {
+    expect(runningBalanceChartFrom('2000-01-01', '2024-02-29')).toBe('2014-03-01')
   })
 })

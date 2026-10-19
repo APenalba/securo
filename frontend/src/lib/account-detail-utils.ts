@@ -1,4 +1,4 @@
-import { addDays, format, parseISO } from 'date-fns'
+import { addDays, addYears, format, parseISO, subYears } from 'date-fns'
 
 import type { ProjectedTransaction, Transaction } from '../types'
 
@@ -126,8 +126,9 @@ export function mergeRunningBalances<R extends ServerBalanceRow, P extends Proje
   return merged
 }
 
-// The running-balance endpoint's cap on daily points (MAX_RUNNING_BALANCE_DAYS).
-const RUNNING_BALANCE_MAX_DAYS = 3660
+// Mirrors the backend's `_MAX_RUNNING_BALANCE_YEARS` (backend/app/api/accounts.py),
+// in calendar years like the reports' custom range.
+const RUNNING_BALANCE_MAX_YEARS = 10
 
 /**
  * First day the chart asks the running-balance series for. A range longer than
@@ -135,6 +136,11 @@ const RUNNING_BALANCE_MAX_DAYS = 3660
  */
 export function runningBalanceChartFrom(from: string, to: string): string {
   if (!from || !to) return from
-  const earliest = format(addDays(parseISO(to), 1 - RUNNING_BALANCE_MAX_DAYS), 'yyyy-MM-dd')
-  return from < earliest ? earliest : from
+  const end = parseISO(to)
+  let earliest = subYears(end, RUNNING_BALANCE_MAX_YEARS)
+  // Ten years back from a Feb 29 lands on Feb 28, and the backend's year step
+  // from there stops a day short of `to`.
+  if (addYears(earliest, RUNNING_BALANCE_MAX_YEARS) < end) earliest = addDays(earliest, 1)
+  const earliestDay = format(earliest, 'yyyy-MM-dd')
+  return from < earliestDay ? earliestDay : from
 }

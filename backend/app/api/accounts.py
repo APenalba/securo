@@ -6,6 +6,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.reports import _add_years
+from app.core.app_clock import app_today
 from app.core.database import get_async_session
 from app.core.workspace_context import (
     WorkspaceContext,
@@ -25,6 +27,11 @@ from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.fx_rate_service import _resolve_rate
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
+
+# Same cap as the reports' custom range (`_MAX_CUSTOM_RANGE_YEARS`), counted
+# the same way: the series has one point per day. The account page charts the
+# latest part of a longer range (#1202).
+_MAX_RUNNING_BALANCE_YEARS = 10
 
 
 @router.get("", response_model=list[AccountRead])
@@ -126,12 +133,26 @@ async def get_account_running_balance(
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Daily balance matching the transaction list's `running_balance` (#1202)."""
+    """Daily balance matching the transaction list's `running_balance` (#1202).
+
+    Missing bounds default like the summary's: month start to today.
+    """
+    today = app_today()
+    date_from = date_from or today.replace(day=1)
+    date_to = date_to or today
+    if date_to < date_from:
+        raise HTTPException(status_code=422, detail="to must be on or after from")
+    if date_to > _add_years(date_from, _MAX_RUNNING_BALANCE_YEARS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Range is too wide (max {_MAX_RUNNING_BALANCE_YEARS} years)",
+        )
+
     accounting_mode = await get_credit_card_accounting_mode(session)
     try:
         series = await account_service.get_account_running_balance(
             session, account_id, ctx.workspace.id, ctx.user.primary_currency,
-            accounting_mode=accounting_mode, date_from=date_from, date_to=date_to,
+            date_from, date_to, accounting_mode=accounting_mode,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

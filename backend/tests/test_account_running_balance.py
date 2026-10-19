@@ -385,8 +385,8 @@ async def test_running_balance_series_rejects_credit_cards(
 
 @pytest.mark.parametrize("date_from, date_to", [
     ("2026-05-02", "2026-05-01"),
-    # One day past the limit: 3,661 points.
-    ("2016-01-01", (date(2016, 1, 1) + timedelta(days=3660)).isoformat()),
+    # One day past ten calendar years, the reports' custom-range cap.
+    ("2016-01-01", "2026-01-02"),
 ])
 @pytest.mark.asyncio
 async def test_running_balance_series_rejects_bad_ranges(
@@ -396,7 +396,7 @@ async def test_running_balance_series_rejects_bad_ranges(
 
     response = await _series(client, auth_headers, account.id, **{"from": date_from, "to": date_to})
 
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -405,14 +405,14 @@ async def test_running_balance_series_accepts_the_longest_range(
 ):
     account = await _make_account(session, test_user.id)
     date_from = date(2016, 1, 1)
-    date_to = date_from + timedelta(days=3659)
+    date_to = date(2026, 1, 1)
 
     response = await _series(
         client, auth_headers, account.id, **{"from": date_from.isoformat(), "to": date_to.isoformat()},
     )
 
     assert response.status_code == 200
-    assert len(response.json()) == 3660
+    assert len(response.json()) == (date_to - date_from).days + 1
 
 
 @pytest.mark.asyncio

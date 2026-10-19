@@ -1184,12 +1184,6 @@ async def get_account_balance_history(
     return series
 
 
-# Upper bound on the daily points one request returns, about ten years. The
-# account page asks for at most this many and charts the latest part of a
-# longer range (#1202).
-MAX_RUNNING_BALANCE_DAYS = 3660
-
-
 def _running_balance_delta(account_currency: str):
     """A row's effect on the account-detail running balance (#1202).
 
@@ -1275,8 +1269,8 @@ async def get_running_balances(
 
 async def get_account_running_balance(
     session: AsyncSession, account_id: uuid.UUID, workspace_id: uuid.UUID,
-    primary_currency: str, accounting_mode: Optional[str] = None,
-    date_from: Optional[_Date] = None, date_to: Optional[_Date] = None,
+    primary_currency: str, date_from: _Date, date_to: _Date,
+    accounting_mode: Optional[str] = None,
 ) -> Optional[list[dict]]:
     """End-of-day balance for every day in [date_from, date_to] (#1202).
 
@@ -1291,16 +1285,6 @@ async def get_account_running_balance(
     # A card's page walks its bill cycle client-side; its balance is the debt.
     if account.type == "credit_card":
         raise ValueError("Running balance is not available for credit card accounts")
-
-    today = app_today()
-    if not date_from:
-        date_from = today.replace(day=1)
-    if not date_to:
-        date_to = today
-    if date_from > date_to:
-        raise ValueError("'from' must be on or before 'to'")
-    if (date_to - date_from).days + 1 > MAX_RUNNING_BALANCE_DAYS:
-        raise ValueError(f"Range cannot exceed {MAX_RUNNING_BALANCE_DAYS} days")
 
     opening, opening_primary = await _running_balance_seed(
         session, account, date_from, primary_currency,
