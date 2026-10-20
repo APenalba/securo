@@ -12,7 +12,11 @@ from app.models.account import Account
 from app.models.transaction import Transaction
 from app.models.workspace import Workspace, WorkspaceMember
 from app.schemas.recurring_transaction import RecurringTransactionCreate
-from app.services import recurring_match_service as rms
+from app.services import (
+    reconciliation_policy,
+    reconciliation_rule_service,
+    recurring_match_service as rms,
+)
 from app.services.text_similarity import token_overlap
 from app.services.recurring_transaction_service import (
     create_recurring_transaction,
@@ -577,3 +581,220 @@ async def test_unlink_recurring_noop_when_not_linked(session, test_user, test_wo
         session, tx.id, test_workspace.id
     )
     assert result is None  # nothing to unlink → 404 at the API layer
+
+
+# ---------------------------------------------------------------------------
+# A workspace's amount rule (issue #1073)
+# ---------------------------------------------------------------------------
+
+
+async def _allow_tolerance(session, test_workspace, test_user, **config):
+    """A workspace that lets a bill match a charge within 5%, and link on it."""
+    await reconciliation_rule_service.upsert_override(
+        session,
+        test_workspace.id,
+        test_user.id,
+        reconciliation_policy.MATCH_RECURRING["node"],
+        "same_account_exact",
+        {
+            "when": {
+                "amount": {"match": "tolerance", "percent": "5"},
+                "unique_candidate": True,
+            },
+            **config,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_rule_still_needs_the_exact_amount(
+    session, test_user, test_workspace, account
+):
+    """A charge a few cents off the bill is still a different amount when the
+    workspace has not said otherwise: nothing links."""
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+
+    assert await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    ) is None
+    assert await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_find_bill_honours_the_workspace_tolerance(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _allow_tolerance(session, test_workspace, test_user)
+
+    match = await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    )
+    assert match is not None and match.id == bill.id
+
+    # Past the tolerance it is a different charge again.
+    assert await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("20.00"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_find_bill_refuses_to_guess_between_bills_within_tolerance(
+    session, test_user, test_workspace, account
+):
+    """The rule asks for a single candidate, and two bills fit."""
+    await _make_bill(session, test_workspace, test_user, account, amount=Decimal("18.43"))
+    await _make_bill(
+        session, test_workspace, test_user, account,
+        amount=Decimal("18.60"), description="Netflix Subscription Family",
+    )
+    await _allow_tolerance(session, test_workspace, test_user)
+
+    assert await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_find_bill_does_not_link_under_a_suggest_outcome(
+    session, test_user, test_workspace, account
+):
+    await _make_bill(session, test_workspace, test_user, account, amount=Decimal("18.43"))
+    await _allow_tolerance(session, test_workspace, test_user, outcome="suggest")
+
+    assert await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_find_placeholder_honours_the_workspace_tolerance(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    placeholder = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+    await _allow_tolerance(session, test_workspace, test_user)
+
+    found = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    )
+    assert found is not None and found.id == placeholder.id
+
+
+@pytest.mark.asyncio
+async def test_find_placeholder_reads_the_recurring_window_from_the_charge(
+    session, test_user, test_workspace, account
+):
+    """The recurring rule allows a charge to post late (five days) more than
+    early (three), measured from the occurrence: the placeholder."""
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+    await _allow_tolerance(session, test_workspace, test_user)
+
+    late = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 14), "NETFLIX SUBSCRIPTION",
+    )
+    early = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 6), "NETFLIX SUBSCRIPTION",
+    )
+    assert late is not None
+    assert early is None
+
+
+@pytest.mark.asyncio
+async def test_find_bill_takes_the_first_rule_that_matches_over_a_better_score(
+    session, test_user, test_workspace, account
+):
+    """Rules are ordered and the first to match wins. The exact bill matches
+    under the shipped rule; the other only under the workspace's own looser
+    rule, with a better description, and must not overtake it."""
+    exact = await _make_bill(
+        session, test_workspace, test_user, account,
+        amount=Decimal("18.71"), description="Netflix Subscription Family",
+    )
+    await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await reconciliation_rule_service.create_custom(
+        session, test_workspace.id, test_user.id,
+        reconciliation_policy.MATCH_RECURRING["node"], "Within five percent",
+        {
+            "outcome": "link",
+            "trigger": "money_arrives",
+            "when": {
+                "counterparty": "any",
+                "same_account": True,
+                "amount": {"match": "tolerance", "percent": "5"},
+                "date": {"before_days": 3, "after_days": 5},
+                "currency": {"conversion": "reject"},
+                "description_similarity": {"min": "0.6"},
+                "unique_candidate": True,
+            },
+        },
+    )
+
+    match = await rms.find_bill_for_incoming(
+        session, test_user.id, account.id, Decimal("18.71"), "BRL", "debit",
+        date(2025, 1, 11), "NETFLIX SUBSCRIPTION",
+    )
+    assert match is not None and match.id == exact.id
+
+
+@pytest.mark.asyncio
+async def test_generate_pending_links_a_charge_within_tolerance(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _allow_tolerance(session, test_workspace, test_user)
+    real = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 11), source="sync", external_id="bank-1",
+        amount=Decimal("18.71"),
+    )
+
+    count = await generate_pending(session, test_user.id, up_to=date(2025, 1, 20))
+
+    assert count == 0
+    await session.refresh(real)
+    assert real.recurring_transaction_id == bill.id
+    result = await session.execute(
+        select(Transaction).where(Transaction.account_id == account.id)
+    )
+    assert len(result.scalars().all()) == 1

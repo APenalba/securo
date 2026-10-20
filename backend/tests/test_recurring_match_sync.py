@@ -28,6 +28,7 @@ from app.models.recurring_transaction import RecurringTransaction
 from app.models.transaction import Transaction
 from app.schemas.recurring_transaction import RecurringTransactionCreate
 from app.schemas.rule import RuleAction, RuleCondition, RuleCreate
+from app.services import reconciliation_policy, reconciliation_rule_service
 from app.services.connection_service import sync_connection
 from app.services.text_similarity import token_overlap
 from app.services.recurring_transaction_service import (
@@ -704,3 +705,45 @@ async def test_resync_is_idempotent(session, test_user, test_workspace, conn_acc
     assert txs[0].recurring_transaction_id == bill_id
     refreshed = await session.get(RecurringTransaction, bill_id)
     assert refreshed.next_occurrence == date(2025, 2, 10)  # advanced once, not twice
+
+
+@pytest.mark.asyncio
+async def test_sync_merges_a_tolerated_amount_into_placeholder(
+    session, test_user, test_workspace, conn_account
+):
+    """Issue #1073: a charge a few cents off the bill still replaces the
+    placeholder when the workspace allows a tolerance, and keeps its amount."""
+    conn, account = conn_account
+    conn_id, account_id = conn.id, account.id
+    await reconciliation_rule_service.upsert_override(
+        session, test_workspace.id, test_user.id,
+        reconciliation_policy.MATCH_RECURRING["node"], "same_account_exact",
+        {"when": {"amount": {"match": "tolerance", "percent": "5"},
+                  "unique_candidate": True}},
+    )
+    bill = await _make_bill(session, test_workspace, test_user, account,
+                            amount=Decimal("18.43"), start_date=date(2025, 1, 10))
+    bill_id = bill.id
+    bill.next_occurrence = date(2025, 2, 10)
+    placeholder = Transaction(
+        user_id=test_user.id, workspace_id=test_workspace.id,
+        account_id=account_id, description="Netflix Subscription",
+        amount=Decimal("18.43"), currency="BRL", date=date(2025, 1, 10),
+        type="debit", source="recurring", status="posted",
+        recurring_transaction_id=bill_id,
+    )
+    session.add(placeholder)
+    await session.commit()
+    placeholder_id = placeholder.id
+    provider = _provider([_tx(external_id="s1", description="NETFLIX SUBSCRIPTION",
+                              amount=Decimal("18.71"), date=date(2025, 1, 11))])
+
+    await _run_sync(session, conn_id, test_workspace, test_user, provider)
+
+    txs = await _all_txs(session, account_id)
+    assert len(txs) == 1
+    assert txs[0].id == placeholder_id
+    assert txs[0].amount == Decimal("18.71")
+    assert txs[0].source == "sync"
+    assert txs[0].external_id == "s1"
+    assert txs[0].recurring_transaction_id == bill_id

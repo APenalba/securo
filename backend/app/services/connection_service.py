@@ -2410,6 +2410,12 @@ async def sync_connection(
                     # win, the charge fills the empty ones, and only its
                     # provenance is recorded outright.
                     placeholder.original_description = txn_data.description
+                    if placeholder.amount != txn_data.amount:
+                        # Matched under a tolerance: the row now stands for
+                        # what was actually charged, not for what the bill
+                        # expected.
+                        placeholder.amount = txn_data.amount
+                        await stamp_primary_amount(session, user_id, placeholder)
                     if placeholder.category_id is None:
                         placeholder.category_id = preview.category_id or category_id
                     if txn_data.payee and not placeholder.payee:
