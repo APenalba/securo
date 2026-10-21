@@ -798,3 +798,217 @@ async def test_generate_pending_links_a_charge_within_tolerance(
         select(Transaction).where(Transaction.account_id == account.id)
     )
     assert len(result.scalars().all()) == 1
+
+
+# ---------------------------------------------------------------------------
+# A workspace's date window
+# ---------------------------------------------------------------------------
+
+
+async def _widen_window(
+    session, test_workspace, test_user, *, before_days=3, after_days=10
+):
+    """A workspace whose bank is slow: a charge may post up to `after_days` late."""
+    await reconciliation_rule_service.upsert_override(
+        session,
+        test_workspace.id,
+        test_user.id,
+        reconciliation_policy.MATCH_RECURRING["node"],
+        "same_account_exact",
+        {"when": {"date": {"before_days": before_days, "after_days": after_days}}},
+    )
+
+
+async def _late_placeholder(session, test_user, test_workspace, account):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    return await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_placeholder_reaches_as_far_as_the_workspace_window(
+    session, test_user, test_workspace, account
+):
+    placeholder = await _late_placeholder(session, test_user, test_workspace, account)
+    await _widen_window(session, test_workspace, test_user)
+
+    found = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.43"), "BRL", "debit",
+        date(2025, 1, 18), "NETFLIX SUBSCRIPTION",
+    )
+    assert found is not None and found.id == placeholder.id
+
+
+@pytest.mark.asyncio
+async def test_find_placeholder_default_window_still_stops_at_five_days(
+    session, test_user, test_workspace, account
+):
+    await _late_placeholder(session, test_user, test_workspace, account)
+
+    found = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.43"), "BRL", "debit",
+        date(2025, 1, 18), "NETFLIX SUBSCRIPTION",
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_generate_pending_links_a_charge_inside_a_widened_window(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _widen_window(session, test_workspace, test_user)
+    real = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 18), source="sync", external_id="bank-1",
+        amount=Decimal("18.43"),
+    )
+
+    count = await generate_pending(session, test_user.id, up_to=date(2025, 1, 20))
+
+    assert count == 0
+    await session.refresh(real)
+    assert real.recurring_transaction_id == bill.id
+    result = await session.execute(
+        select(Transaction).where(Transaction.account_id == account.id)
+    )
+    assert len(result.scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_pending_default_window_does_not_link_a_late_charge(
+    session, test_user, test_workspace, account
+):
+    await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    real = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 18), source="sync", external_id="bank-1",
+        amount=Decimal("18.43"),
+    )
+
+    count = await generate_pending(session, test_user.id, up_to=date(2025, 1, 20))
+
+    assert count == 1
+    await session.refresh(real)
+    assert real.recurring_transaction_id is None
+
+
+@pytest.mark.asyncio
+async def test_find_placeholder_prefers_the_nearest_of_two_tied_placeholders(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _widen_window(session, test_workspace, test_user, after_days=40)
+    # The farther one goes in first, so insertion order would pick it.
+    far = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+    near = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 2, 10), source="recurring", external_id=None,
+        recurring_transaction_id=bill.id, description="Netflix Subscription",
+        amount=Decimal("18.43"),
+    )
+
+    found = await rms.find_placeholder_for_incoming(
+        session, account.id, Decimal("18.43"), "BRL", "debit",
+        date(2025, 2, 18), "NETFLIX SUBSCRIPTION",
+    )
+    assert found is not None and found.id == near.id
+    assert found.id != far.id
+
+
+@pytest.mark.asyncio
+async def test_find_real_tx_prefers_the_nearest_of_two_tied_charges(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    await _widen_window(session, test_workspace, test_user, after_days=40)
+    # The farther one goes in first, so insertion order would pick it.
+    far = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 3, 12), source="sync", external_id="bank-far",
+        amount=Decimal("18.43"),
+    )
+    near = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 2, 11), source="sync", external_id="bank-near",
+        amount=Decimal("18.43"),
+    )
+
+    found = await rms.find_real_tx_for_occurrence(session, bill, date(2025, 2, 10))
+    assert found is not None and found.id == near.id
+    assert found.id != far.id
+
+
+@pytest.mark.asyncio
+async def test_find_real_tx_breaks_an_equal_distance_tie_towards_the_earlier(
+    session, test_user, test_workspace, account
+):
+    bill = await _make_bill(
+        session, test_workspace, test_user, account, amount=Decimal("18.43")
+    )
+    # The later one goes in first, so insertion order would pick it.
+    later = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 2, 13), source="sync", external_id="bank-later",
+        amount=Decimal("18.43"),
+    )
+    earlier = await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 2, 7), source="sync", external_id="bank-earlier",
+        amount=Decimal("18.43"),
+    )
+
+    found = await rms.find_real_tx_for_occurrence(session, bill, date(2025, 2, 10))
+    assert found is not None and found.id == earlier.id
+    assert found.id != later.id
+
+
+@pytest.mark.asyncio
+async def test_widened_window_weekly_clamp_still_wins(
+    session, test_user, test_workspace, account
+):
+    """A guard: the weekly clamp already held before the window followed the policy."""
+    bill = await _make_bill(
+        session, test_workspace, test_user, account,
+        amount=Decimal("18.43"), frequency="weekly",
+    )
+    await _widen_window(session, test_workspace, test_user, before_days=10, after_days=10)
+    await _add_tx(
+        session, test_user, test_workspace, account,
+        date=date(2025, 1, 14), source="sync", external_id="bank-1",
+        amount=Decimal("18.43"),
+    )
+
+    assert await rms.find_real_tx_for_occurrence(session, bill, date(2025, 1, 10)) is None
+
+
+def test_date_reach_reads_only_the_enabled_rules_windows():
+    policy = {
+        "strategies": [
+            {"enabled": True, "when": {"date": {"before_days": 3, "after_days": 5}}},
+            {"enabled": False, "when": {"date": {"before_days": 30, "after_days": 40}}},
+            {"enabled": True, "when": {}},
+        ]
+    }
+
+    assert rms._date_reach(policy) == (3, 5)
+    assert rms._date_reach({"strategies": []}) == (0, 0)

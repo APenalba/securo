@@ -30,6 +30,9 @@ engine rejects a different amount just as the query used to. Where a rule
 does link on an approximate amount it must say `unique_candidate`, and since
 these lookups ask the engine about one candidate at a time, that guard is
 enforced here instead: two fits under such a rule are a question, not a pick.
+Nor does this module pick the date range: the queries read it off the policy
+(`_date_reach`), so a window a workspace has widened reaches the candidates
+instead of being cut off before the policy sees them.
 
 The queries stay here, because they are what differs: three lookups, in two
 directions, over two tables. Only the verdict is shared.
@@ -42,11 +45,12 @@ identity.
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.account import Account
 from app.models.recurring_transaction import RecurringTransaction
 from app.models.transaction import Transaction
 from app.services import reconciliation_policy, reconciliation_rule_service
@@ -56,12 +60,22 @@ from app.services.reconciliation_engine import Expectation, Movement, evaluate
 # "recurring" itself: that is the generated placeholder, handled separately.
 _REAL_SOURCES = ("sync", "ofx", "csv", "manual")
 
-#: The widest window any recurring policy uses, in days. Only the SQL date
-#: range is cut with it; the policy still decides, per candidate, whether a
-#: charge is close enough. Kept generous on purpose: narrowing the query to
-#: the exact window would silently re-implement the rule in a second place,
-#: and the two would drift.
-_QUERY_WINDOW_DAYS = 5
+
+def _date_reach(policy: dict[str, Any]) -> tuple[int, int]:
+    """How far before and after its expectation any rule lets a movement sit.
+
+    Only the SQL date range is cut with it; the policy still decides, per
+    candidate. Read off the policy itself, so the query can never be
+    narrower than a rule a workspace has widened, nor drift from it.
+    """
+    before = after = 0
+    for strategy in policy.get("strategies", []):
+        if not strategy.get("enabled", True):
+            continue
+        window = strategy.get("when", {}).get("date") or {}
+        before = max(before, int(window.get("before_days", 0)))
+        after = max(after, int(window.get("after_days", 0)))
+    return before, after
 
 
 def _as_movement(transaction: Transaction) -> Movement:
@@ -109,7 +123,9 @@ def _best_movement(
     round, so it is asked once per candidate and the answers are ranked: the
     earlier rule first, then the best score. Two subscriptions of the same
     value on one account are told apart by their description, not refused,
-    unless the rule that linked them asks for a single candidate.
+    unless the rule that linked them asks for a single candidate. On an equal
+    score the first candidate passed in wins, and the callers pass them nearest
+    first.
     """
     linked = []
     for candidate in candidates:
@@ -134,6 +150,10 @@ async def find_real_tx_for_occurrence(
     policy = await reconciliation_rule_service.resolve_recurring(
         session, recurring.workspace_id, recurring.frequency
     )
+    # The charge is the movement and the occurrence the expectation, so the
+    # charge may be up to `before` days earlier than the occurrence, or `after`
+    # days later.
+    before, after = _date_reach(policy)
     result = await session.execute(
         select(Transaction).where(
             Transaction.account_id == recurring.account_id,
@@ -141,13 +161,20 @@ async def find_real_tx_for_occurrence(
             Transaction.source.in_(_REAL_SOURCES),
             Transaction.currency == recurring.currency,
             Transaction.type == recurring.type,
-            Transaction.date >= occurrence_date - timedelta(days=_QUERY_WINDOW_DAYS),
-            Transaction.date <= occurrence_date + timedelta(days=_QUERY_WINDOW_DAYS),
+            Transaction.date >= occurrence_date - timedelta(days=before),
+            Transaction.date <= occurrence_date + timedelta(days=after),
         )
     )
-    return _best_movement(
-        result.scalars(), _as_occurrence(recurring, occurrence_date), policy
+    # The score only reads the description, so two charges can tie, and with a
+    # window as long as the billing period that is no rare thing. Looking at
+    # the nearest first makes the nearest win the tie rather than the database;
+    # at equal distance the earlier wins, a fixed order rather than the
+    # database's.
+    nearest = sorted(
+        result.scalars(),
+        key=lambda tx: (abs((tx.date - occurrence_date).days), tx.date, tx.id),
     )
+    return _best_movement(nearest, _as_occurrence(recurring, occurrence_date), policy)
 
 
 async def find_placeholder_for_incoming(
@@ -167,7 +194,7 @@ async def find_placeholder_for_incoming(
 
     Inverted from the rest of the module: the placeholder is the thing being
     searched for, so the incoming charge plays the part of the promise and each
-    placeholder is scored against it. The window is symmetric here: a
+    placeholder is scored against it. The shipped window is symmetric here: a
     placeholder was written for one specific occurrence, so unlike a bill it has
     no neighbour to be confused with.
 
@@ -179,8 +206,25 @@ async def find_placeholder_for_incoming(
     different amount means the placeholder too, or the charge would be written
     next to it instead, and the rule's window and tolerance only mean what
     they say read that way round.
+
+    The two passes read the window in opposite directions (the placeholder is
+    the movement in one, the expectation in the other), so the query reaches as
+    far as the wider of the two on each side and the policies decide from
+    there. The workspace's rule is resolved before the query for that reason.
     """
+    account = await session.get(Account, account_id)
+    if account is None:
+        return None
     policy = reconciliation_policy.default_policy("reconciliation.match_placeholder")
+    composed = await reconciliation_rule_service.resolve(
+        session,
+        account.workspace_id,
+        reconciliation_policy.MATCH_RECURRING["node"],
+    )
+    # Narrowing for frequency only ever shrinks a window, so the unnarrowed
+    # rule is an upper bound for the query.
+    p_before, p_after = _date_reach(policy)
+    r_before, r_after = _date_reach(composed)
     result = await session.execute(
         select(Transaction, RecurringTransaction.frequency)
         .join(
@@ -194,11 +238,17 @@ async def find_placeholder_for_incoming(
             Transaction.external_id.is_(None),
             Transaction.currency == currency,
             Transaction.type == tx_type,
-            Transaction.date >= tx_date - timedelta(days=_QUERY_WINDOW_DAYS),
-            Transaction.date <= tx_date + timedelta(days=_QUERY_WINDOW_DAYS),
+            Transaction.date >= tx_date - timedelta(days=max(p_before, r_after)),
+            Transaction.date <= tx_date + timedelta(days=max(p_after, r_before)),
         )
     )
-    rows = result.all()
+    # The score only reads the description, so tied placeholders go to the
+    # nearest in date, which both passes honour by seeing it first; at equal
+    # distance the earlier wins, a fixed order rather than the database's.
+    rows = sorted(
+        result.all(),
+        key=lambda row: (abs((row[0].date - tx_date).days), row[0].date, row[0].id),
+    )
     incoming = Expectation(
         kind="recurring",
         id=uuid.uuid4(),
@@ -213,12 +263,6 @@ async def find_placeholder_for_incoming(
     if found is not None or not rows:
         return found
 
-    # Every placeholder here sits on one account, so they share a workspace.
-    composed = await reconciliation_rule_service.resolve(
-        session,
-        rows[0][0].workspace_id,
-        reconciliation_policy.MATCH_RECURRING["node"],
-    )
     charge = Movement(
         amount=amount,
         currency=currency,

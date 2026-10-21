@@ -571,3 +571,44 @@ async def test_import_merges_a_tolerated_amount_into_placeholder(
     assert txs[0].source == "csv"
     assert txs[0].recurring_transaction_id == bill_id
     stamp.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_import_merges_a_late_charge_inside_a_widened_window(
+    session, test_user, test_workspace, test_account
+):
+    """The workspace's bank posts up to ten days late, so a charge eight days
+    after the placeholder still becomes the placeholder rather than a twin."""
+    account_id = test_account.id
+    await reconciliation_rule_service.upsert_override(
+        session, test_workspace.id, test_user.id,
+        reconciliation_policy.MATCH_RECURRING["node"], "same_account_exact",
+        {"when": {"date": {"before_days": 3, "after_days": 10}}},
+    )
+    bill = await _make_bill(session, test_workspace, test_user, test_account,
+                            amount=Decimal("18.43"), start_date=date(2026, 1, 10))
+    bill_id = bill.id
+    bill.next_occurrence = date(2026, 2, 10)
+    placeholder = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, account_id=account_id,
+        workspace_id=test_workspace.id, description="Netflix Subscription",
+        amount=Decimal("18.43"), currency="BRL", date=date(2026, 1, 10),
+        type="debit", source="recurring", status="posted",
+        recurring_transaction_id=bill_id, created_at=datetime.now(timezone.utc),
+    )
+    session.add(placeholder)
+    await session.commit()
+    placeholder_id = placeholder.id
+
+    txns = [TransactionImport(description="NETFLIX SUBSCRIPTION", amount=Decimal("18.43"),
+                              date=date(2026, 1, 18), type="debit", currency="BRL")]
+    imported, _, _, _ = await _run_import(
+        session, test_workspace, test_user, account_id, txns
+    )
+
+    assert imported == 1
+    txs = await _real_txs(session, account_id)
+    assert len(txs) == 1
+    assert txs[0].id == placeholder_id
+    assert txs[0].source == "csv"
+    assert txs[0].recurring_transaction_id == bill_id
