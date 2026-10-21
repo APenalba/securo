@@ -1004,8 +1004,9 @@ async def import_transactions(
             # wins, the charge only fills what is still empty, and only its
             # provenance is recorded outright.
             placeholder.original_description = txn_data.description
-            if placeholder.amount != txn_data.amount:
-                # Matched under a tolerance: the row now stands for what was
+            if placeholder.amount != txn_data.amount or txn_data.fx_rate:
+                # Matched under a tolerance, or the file says what the charge
+                # cost in the primary currency: the row now stands for what was
                 # actually charged, not for what the bill expected.
                 placeholder.amount = txn_data.amount
                 if txn_data.fx_rate:
