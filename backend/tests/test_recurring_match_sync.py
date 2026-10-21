@@ -30,6 +30,7 @@ from app.schemas.recurring_transaction import RecurringTransactionCreate
 from app.schemas.rule import RuleAction, RuleCondition, RuleCreate
 from app.services import reconciliation_policy, reconciliation_rule_service
 from app.services.connection_service import sync_connection
+from app.services.fx_rate_service import stamp_primary_amount
 from app.services.text_similarity import token_overlap
 from app.services.recurring_transaction_service import (
     create_recurring_transaction,
@@ -727,7 +728,8 @@ async def test_sync_merges_a_tolerated_amount_into_placeholder(
     session, test_user, test_workspace, conn_account
 ):
     """Issue #1073: a charge a few cents off the bill still replaces the
-    placeholder when the workspace allows a tolerance, and keeps its amount."""
+    placeholder when the workspace allows a tolerance; the amount and the
+    primary-currency amount become the charge's."""
     conn, account = conn_account
     conn_id, account_id = conn.id, account.id
     await reconciliation_rule_service.upsert_override(
@@ -746,6 +748,7 @@ async def test_sync_merges_a_tolerated_amount_into_placeholder(
         amount=Decimal("18.43"), currency="BRL", date=date(2025, 1, 10),
         type="debit", source="recurring", status="posted",
         recurring_transaction_id=bill_id,
+        amount_primary=Decimal("18.43"), fx_rate_used=Decimal("1"),
     )
     session.add(placeholder)
     await session.commit()
@@ -753,15 +756,22 @@ async def test_sync_merges_a_tolerated_amount_into_placeholder(
     provider = _provider([_tx(external_id="s1", description="NETFLIX SUBSCRIPTION",
                               amount=Decimal("18.71"), date=date(2025, 1, 11))])
 
-    await _run_sync(session, conn_id, test_workspace, test_user, provider)
+    stamp = AsyncMock(wraps=stamp_primary_amount)
+
+    await _run_sync(
+        session, conn_id, test_workspace, test_user, provider, stamp=stamp
+    )
 
     txs = await _all_txs(session, account_id)
     assert len(txs) == 1
     assert txs[0].id == placeholder_id
     assert txs[0].amount == Decimal("18.71")
+    assert txs[0].amount_primary == Decimal("18.71")
+    assert txs[0].fx_rate_used == Decimal("1")
     assert txs[0].source == "sync"
     assert txs[0].external_id == "s1"
     assert txs[0].recurring_transaction_id == bill_id
+    stamp.assert_awaited_once()
 
 
 @pytest.mark.asyncio
